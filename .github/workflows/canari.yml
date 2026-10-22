@@ -1,11 +1,16 @@
 name: Europarl canari WAF
 
-# Test quotidien : le WAF AWS d'europarl.europa.eu tolere-t-il des requetes
-# lentes depuis les IP Azure de GitHub Actions ?
-# Le job ECHOUE uniquement si 0 % de HTTP 200 (pour alerter).
-# Resume (job summary) + artifact CSV des codes HTTP obtenus.
+# Test : le WAF AWS d'europarl.europa.eu tolere-t-il des requetes lentes
+# depuis les IP Azure de GitHub Actions ?
+# Se declenche a chaque push (boucle de developpement) + cron quotidien.
+# Le script publie sa sortie et ses diagnostics dans une issue du repo,
+# lisible a distance. Echec du job uniquement si 0 % de HTTP 200.
 
 on:
+  push:
+    paths:
+      - "pe_canari.py"
+      - ".github/workflows/canari.yml"
   schedule:
     - cron: "41 3 * * *"
   workflow_dispatch:
@@ -21,6 +26,7 @@ concurrency:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   canari:
@@ -36,14 +42,40 @@ jobs:
           python-version: "3.12"
 
       - name: Test WAF
+        id: test
         env:
           LIMITE: ${{ inputs.limite || '84' }}
-        run: python pe_canari.py
+        run: python pe_canari.py 2>&1 | tee sortie.txt
+        continue-on-error: true
 
-      - name: Artifact resultats
+      - name: Bilan dans une issue
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: canari-resultats
-          path: canari_resultats.csv
-          if-no-files-found: ignore
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_TITLE: "Run canari #${{ github.run_number }}"
+        run: |
+          {
+            echo "## Run #${{ github.run_number }}"
+            echo ""
+            echo "- Etat du job : ${{ steps.test.outcome }}"
+            echo "- Commit : ${{ github.sha }}"
+            echo "- Lien run : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo ""
+            echo '<details><summary>Sortie du script</summary>'
+            echo ""
+            echo '~~~'
+            cat sortie.txt
+            echo '~~~'
+            echo "</details>"
+            echo ""
+            if [ -f diag.txt ]; then
+              echo '<details><summary>Diagnostic API (extrait du corps recu)</summary>'
+              echo ""
+              echo '~~~xml'
+              cat diag.txt
+              echo '~~~'
+              echo "</details>"
+            fi
+          } > corps_issue.md
+          gh issue create --title "$ISSUE_TITLE" --body-file corps_issue.md || \
+            gh issue comment "$(gh issue list --limit 1 --json number --jq '.[0].number')" --body-file corps_issue.md

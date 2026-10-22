@@ -2,18 +2,15 @@
 """Canari : le WAF d'europarl.europa.eu laisse-t-il passer des requetes lentes
 depuis une IP datacenter (GitHub Actions) ?
 
-- Liste des MPE via l'API open data v2 du Parlement europeen (CC BY 4.0).
-  NB : l'API renvoie du RDF/XML quel que soit le parametre format demande
-  (constate le 22/10/2026) -> le parseur accepte RDF/XML, JSON-LD et JSONL.
+- Liste des MPE via l'API open data v2 (RDF/XML constate le 22/10/2026).
 - 1 requete toutes les PAUSE secondes, en-tetes navigateur, timeout court.
-- Sortie : resume dans GITHUB_STEP_SUMMARY + canari_resultats.csv.
-- Code de sortie : 2 si la liste MPE echoue, 1 si 0 % de HTTP 200, sinon 0.
+- Publie sortie.txt (et diag.txt en cas d'echec API) pour le bilan d'issue.
+- Sortie : 2 si liste MPE HS, 1 si 0 % de HTTP 200, sinon 0.
 
 Aucune donnee personnelle n'est extraite : on ne releve que des codes HTTP.
 """
 
 import csv
-import io
 import json
 import re
 import os
@@ -25,7 +22,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 LIMITE = int(os.environ.get("LIMITE", "84"))
-PAUSE = 15  # secondes entre requetes -> 84 fiches ~ 21 min
+PAUSE = 15
 TIMEOUT = 20
 API = "https://data.europarl.europa.eu/api/v2/meps"
 
@@ -55,22 +52,24 @@ def get(url, headers=HEADERS, timeout=TIMEOUT):
         return 0, str(e).encode()
 
 
-RE_URI_MEP = re.compile(r"/meps?/(\d+)")
-
-
 def extraire_ids_rdf(body):
-    """RDF/XML : chaque entite Person a rdf:about="..../meps/<numero>"."""
+    """RDF/XML : identifiants depuis rdf:about/rdf:resource et identifiants
+    numeriques presents comme valeurs. Defense en profondeur : on collecte
+    tout attribut URI contenant un identifiant numerique, et les elements
+    dont le tag local évoque un identifier/date d'entree."""
     ids = []
     try:
         racine = ET.fromstring(body)
     except ET.ParseError:
         return []
-    RDF_ABOUT = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about"
     for elem in racine.iter():
-        uri = elem.attrib.get(RDF_ABOUT, "")
-        m = RE_URI_MEP.search(uri)
-        if m:
-            ids.append(m.group(1))
+        for val in elem.attrib.values():
+            m = re.search(r"meps?/(\d+)", val)
+            if m:
+                ids.append(m.group(1))
+        tag = elem.tag.rsplit("}", 1)[-1].lower()
+        if tag in ("identifier", "id", "dentifier") and (elem.text or "").strip().isdigit():
+            ids.append(elem.text.strip())
     return list(dict.fromkeys(ids))
 
 
@@ -104,7 +103,7 @@ def extraire_ids_json(body):
             continue
         ident = obj.get("identifier")
         if ident is None and isinstance(obj.get("id"), str):
-            m = RE_URI_MEP.search(obj["id"])
+            m = re.search(r"meps?/(\d+)", obj["id"])
             ident = m.group(1) if m else None
         if ident:
             ids.append(str(ident))
@@ -116,6 +115,7 @@ def extraire_ids(body):
 
 
 def meps_depuis_api():
+    diag = io = ""
     for params in VARIANTES:
         ids, offset = [], 0
         while True:
@@ -129,8 +129,10 @@ def meps_depuis_api():
             lot = extraire_ids(body)
             if not lot:
                 print(f"  variante {params} offset={offset}: 200, {len(body)} octets, 0 MPE lisible")
-                print("  diagnostic, 300 premiers caracteres du corps :")
-                print("  " + body.decode("utf-8", "replace")[:300])
+                # Diagnostic pousse dans l'issue via diag.txt
+                with open("diag.txt", "w", encoding="utf-8") as f:
+                    f.write(f"Requete : {url}\n\n")
+                    f.write(body.decode("utf-8", "replace")[:4000])
                 break
             ids.extend(lot)
             if len(lot) < int(params["limit"]):
@@ -146,7 +148,7 @@ def meps_depuis_api():
 def main():
     meps = meps_depuis_api()
     if not meps:
-        print("!! Aucun MPE recuperable via l'API v2 : voir les diagnostics ci-dessus.")
+        print("!! Aucun MPE recuperable via l'API v2.")
         sys.exit(2)
 
     meps = meps[:LIMITE]
