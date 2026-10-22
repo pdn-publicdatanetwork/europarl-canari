@@ -1,7 +1,7 @@
 name: Collecte Wayback europarl
 
 # Collecte quotidienne des pages assistants des MPE francais via le Wayback
-# Machine (SPN anonyme -> snapshot -> parsing HTML). Aucune requete directe a
+# Machine (CDX + snapshots existants). Aucune requete directe a
 # europarl.europa.eu : le WAF n'est jamais sollicite par nos IP.
 # Se declenche a chaque push (boucle de developpement) + cron quotidien.
 
@@ -30,7 +30,7 @@ permissions:
 jobs:
   collecte:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,18 +46,18 @@ jobs:
       - name: Collecte
         id: collecte
         env:
-          LIMITE: ${{ inputs.limite || '5' }}
+          LIMITE: ${{ inputs.limite || '84' }}
         run: python pe_wayback_collect.py 2>&1 | tee sortie.txt
         continue-on-error: true
 
       - name: Commit CSV
-        if: steps.collecte.outcome == 'success' && hashFiles('data/*.csv') != ''
+        if: steps.collecte.outcome == 'success'
         run: |
           if [ ! -d data ]; then
             echo "Pas de dossier data, rien a committer"
             exit 0
           fi
-          if git diff --quiet -- data/; then
+          if [ -z "$(git status --porcelain data/)" ]; then
             echo "Aucun changement de donnees"
           else
             git config user.name "DataParl"

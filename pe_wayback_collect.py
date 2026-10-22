@@ -3,11 +3,12 @@
 
 Sources :
   - Liste des MPE : referentiel public du projet (parlementaires.csv, chambre
-    europarl, actif=1) -> data.gouv / GitHub public. Repli : affectations.csv,
-    puis l'API v2 du PE (filtre pays ignore).
+    europarl, actif=1). Repli : affectations.csv, puis API v2 du PE.
   - Pages assistants : snapshots du Wayback Machine via CDX (prefixe par MPE,
-    filtre original:.*assistants.*). Aucune requete vers europarl.europa.eu :
-    le WAF n'est jamais sollicite. SPN anonyme abandonne (HTTP 523).
+    filtre original:.*assistants.*). Aucune requete vers europarl.europa.eu.
+    SPN anonyme abandonne (HTTP 523, compte requis).
+
+Wayback rate-limitant (429) : chaque requete est retryee avec backoff.
 
 Sortie : data/europarl_assistants.csv + bilan dans une issue GitHub.
 """
@@ -26,8 +27,8 @@ import xml.etree.ElementTree as ET
 
 from bs4 import BeautifulSoup
 
-LIMITE = int(os.environ.get("LIMITE", "5"))
-PAUSE_GET = 5
+LIMITE = int(os.environ.get("LIMITE", "84"))
+PAUSE_GET = 12
 TIMEOUT = 60
 FRAIS_MAX_H = int(os.environ.get("FRAIS_MAX_H", "168"))
 
@@ -50,8 +51,8 @@ HEADERS = {
 }
 
 
-def get(url, headers=HEADERS, timeout=TIMEOUT):
-    req = urllib.request.Request(url, headers=headers)
+def _get_once(url, timeout):
+    req = urllib.request.Request(url, headers=HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read()
@@ -61,8 +62,22 @@ def get(url, headers=HEADERS, timeout=TIMEOUT):
         return 0, str(e).encode()
 
 
+def get(url, timeout=TIMEOUT, retries=3, backoff=(30, 60)):
+    """GET avec retry sur 429 / erreurs reseau (Wayback rate-limite)."""
+    code, body = _get_once(url, timeout)
+    for i in range(retries - 1):
+        if code == 200 and body:
+            return code, body
+        if code not in (429, 0, 502, 503, 504):
+            return code, body
+        pause = backoff[min(i, len(backoff) - 1)]
+        print(f"    HTTP {code}, nouvelle tentative dans {pause}s...")
+        time.sleep(pause)
+        code, body = _get_once(url, timeout)
+    return code, body
+
+
 def meps_depuis_referentiel():
-    """Referentiel public du projet : chambre=europarl, actif=1."""
     code, body = get(RAW_PARLEMENTAIRES)
     if code != 200:
         print(f"  referentiel: HTTP {code}")
@@ -77,7 +92,6 @@ def meps_depuis_referentiel():
 
 
 def meps_depuis_affectations():
-    """Repli : ids uniques du CSV d'affectations (public)."""
     code, body = get(RAW_AFFECTATIONS)
     if code != 200:
         print(f"  affectations: HTTP {code}")
@@ -113,7 +127,7 @@ def meps_depuis_api():
     params = {"parliamentary-term": "10", "limit": "200"}
     while True:
         q = dict(params, offset=str(offset))
-        code, body = get(API + "?" + urllib.parse.urlencode(q))
+        code, body = get(API + "?" + urllib.parse.urlencode(q), retries=1)
         if code != 200 or not body:
             print(f"  API offset={offset}: HTTP {code}")
             break
@@ -138,9 +152,7 @@ def meps():
 
 
 def snapshots_assistants(mid):
-    """CDX par prefixe : dernier snapshot de la page assistants du MPE.
-    Methode identique a pe_historique.py : prefixe /meps/<langue>/,
-    filtre original:.*assistants.*."""
+    """CDX par prefixe : snapshots de la page assistants du MPE (cf. pe_historique)."""
     q = urllib.parse.urlencode({
         "url": f"europarl.europa.eu/meps/fr/{mid}/",
         "matchType": "prefix",
@@ -175,23 +187,6 @@ def age_heures(timestamp):
     except Exception:
         return None
     return max(0.0, (time.time() - epoch) / 3600)
-
-
-CATEGORIES = {
-    "accrédité": "accredites",
-    "accredite": "accredites",
-    "accredited": "accredites",
-    "local": "locaux",
-    "vice": "vice-presidence_questure",
-    "questure": "vice-presidence_questure",
-    "quaestor": "vice-presidence_questure",
-    "service provider": "prestataires",
-    "prestataire": "prestataires",
-    "paying agent": "tiers_payants",
-    "payant": "tiers_payants",
-    "stagiaire": "stagiaires",
-    "trainee": "stagiaires",
-}
 
 
 def categorie_depuis(texte):
@@ -264,7 +259,7 @@ def main():
             ages.append(age)
         fraicheur = "frais" if (age is not None and age <= FRAIS_MAX_H) else f"perime ({age:.0f}h)" if age else "?"
 
-        code, body = get(WB_WEB + ts + "/" + url_originale)
+        code, body = get(WB_WEB + ts + "/" + url_originale, timeout=90)
         if code != 200:
             print(f"[{i}/{len(meps_liste)}] {mid}: snapshot {ts} HTTP {code} -> KO")
             stats["sans_snapshot"] += 1
@@ -296,10 +291,10 @@ def main():
             w.writerow([mid, nom, cat, snap,
                         f"https://www.europarl.europa.eu/meps/fr/{mid}/assistants"])
 
-    ages_txt = ", ".join(f"{a:.0f}h" for a in sorted(ages)[:5]) if ages else "aucun"
+    ages_txt = ", ".join(f"{a:.0f}h" for a in sorted(ages)[:8]) if ages else "aucun"
     print(f"\nResume : {stats['ok']} MPE collectes, {stats['sans_snapshot']} sans snapshot, "
           f"{stats['sans_noms']} sans noms, {stats['perimes']} perimes")
-    print(f"Ages des snapshots (5 plus frais) : {ages_txt}")
+    print(f"Ages des snapshots (8 plus frais) : {ages_txt}")
     print(f"Total lignes CSV : {len(lignes_csv)}")
 
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
