@@ -3,6 +3,8 @@
 depuis une IP datacenter (GitHub Actions) ?
 
 - Liste des MPE via l'API open data v2 du Parlement europeen (CC BY 4.0).
+  NB : l'API renvoie du RDF/XML quel que soit le parametre format demande
+  (constate le 22/10/2026) -> le parseur accepte RDF/XML, JSON-LD et JSONL.
 - 1 requete toutes les PAUSE secondes, en-tetes navigateur, timeout court.
 - Sortie : resume dans GITHUB_STEP_SUMMARY + canari_resultats.csv.
 - Code de sortie : 2 si la liste MPE echoue, 1 si 0 % de HTTP 200, sinon 0.
@@ -11,14 +13,16 @@ Aucune donnee personnelle n'est extraite : on ne releve que des codes HTTP.
 """
 
 import csv
+import io
 import json
-import os
 import re
+import os
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
 LIMITE = int(os.environ.get("LIMITE", "84"))
 PAUSE = 15  # secondes entre requetes -> 84 fiches ~ 21 min
@@ -35,9 +39,8 @@ HEADERS = {
 }
 
 VARIANTES = [
-    {"format": "jsonl", "parliamentary-term": "10", "country-code": "FRA", "limit": "200"},
-    {"format": "jsonl", "parliamentary-term": "10", "limit": "200"},
-    {"format": "jsonl", "limit": "200"},
+    {"parliamentary-term": "10", "country-code": "FRA", "limit": "200"},
+    {"parliamentary-term": "10", "limit": "200"},
 ]
 
 
@@ -52,61 +55,64 @@ def get(url, headers=HEADERS, timeout=TIMEOUT):
         return 0, str(e).encode()
 
 
-def iter_objets(body):
-    """Genere les objets JSON d'une reponse, quel que soit son habillage :
-    JSONL (un objet par ligne), JSON tableau unique, JSON-LD avec @graph."""
+RE_URI_MEP = re.compile(r"/meps?/(\d+)")
+
+
+def extraire_ids_rdf(body):
+    """RDF/XML : chaque entite Person a rdf:about="..../meps/<numero>"."""
+    ids = []
+    try:
+        racine = ET.fromstring(body)
+    except ET.ParseError:
+        return []
+    RDF_ABOUT = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about"
+    for elem in racine.iter():
+        uri = elem.attrib.get(RDF_ABOUT, "")
+        m = RE_URI_MEP.search(uri)
+        if m:
+            ids.append(m.group(1))
+    return list(dict.fromkeys(ids))
+
+
+def extraire_ids_json(body):
     texte = body.decode("utf-8", "replace").strip()
-    # 1) JSONL : un objet par ligne
+    objets = []
     lignes = [l for l in texte.splitlines() if l.strip()]
     if len(lignes) > 1:
-        ok = 0
-        for l in lignes:
-            try:
-                json.loads(l)
-                ok += 1
-            except Exception:
-                ok = 0
-                break
-        if ok:
-            for l in lignes:
-                yield json.loads(l)
-            return
-    # 2) JSON unique (tableau, @graph, ou objet)
-    try:
-        doc = json.loads(texte)
-    except Exception:
-        return
-    pile = [doc]
-    while pile:
-        n = pile.pop()
-        if isinstance(n, list):
-            pile.extend(n)
-        elif isinstance(n, dict):
-            if "@graph" in n and isinstance(n["@graph"], list):
-                pile.extend(n["@graph"])
-            else:
-                yield n
-
-
-def extraire_ids(body):
+        try:
+            objets = [json.loads(l) for l in lignes]
+        except Exception:
+            objets = []
+    if not objets:
+        try:
+            doc = json.loads(texte)
+            pile = [doc]
+            while pile:
+                n = pile.pop()
+                if isinstance(n, list):
+                    pile.extend(n)
+                elif isinstance(n, dict):
+                    if isinstance(n.get("@graph"), list):
+                        pile.extend(n["@graph"])
+                    else:
+                        objets.append(n)
+        except Exception:
+            objets = []
     ids = []
-    for obj in iter_objets(body):
+    for obj in objets:
+        if not isinstance(obj, dict):
+            continue
         ident = obj.get("identifier")
         if ident is None and isinstance(obj.get("id"), str):
-            fin = obj["id"].rstrip("/").rsplit("/", 1)[-1]
-            if fin.isdigit():
-                ident = fin
-        if ident is None:
-            # chercher une URI .../meps/<numero> dans les valeurs
-            for v in obj.values():
-                if isinstance(v, str):
-                    m = re.search(r"/meps/(\d+)", v)
-                    if m:
-                        ident = m.group(1)
-                        break
+            m = RE_URI_MEP.search(obj["id"])
+            ident = m.group(1) if m else None
         if ident:
             ids.append(str(ident))
     return list(dict.fromkeys(ids))
+
+
+def extraire_ids(body):
+    return extraire_ids_rdf(body) or extraire_ids_json(body)
 
 
 def meps_depuis_api():
