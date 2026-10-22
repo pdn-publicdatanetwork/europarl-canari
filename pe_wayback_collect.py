@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Collecte des assistants des MPE francais via le Wayback Machine.
 
-Pipeline par MPE :
-  1. SPN anonyme (best effort, souvent 523 sans compte) : capture du jour
-  2. CDX par PREFIXE : dernier snapshot existant de la page assistants
-     (les snapshots Wayback sont sous la forme /meps/fr/<id>/<slug>/assistants)
-  3. Telechargement du snapshot et parsing HTML (categories + noms)
-Sortie : data/europarl_assistants.csv (mep_id, nom, categorie, snapshot, url)
+Sources :
+  - Liste des MPE : referentiel public du projet (parlementaires.csv, chambre
+    europarl, actif=1) -> data.gouv / GitHub public. Repli : affectations.csv,
+    puis l'API v2 du PE (filtre pays ignore).
+  - Pages assistants : snapshots du Wayback Machine via CDX (prefixe par MPE,
+    filtre original:.*assistants.*). Aucune requete vers europarl.europa.eu :
+    le WAF n'est jamais sollicite. SPN anonyme abandonne (HTTP 523).
 
-Aucune requete vers europarl.europa.eu : seul web.archive.org est sollicite.
+Sortie : data/europarl_assistants.csv + bilan dans une issue GitHub.
 """
 
 import csv
+import io
 import json
 import os
 import re
@@ -25,14 +27,17 @@ import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 
 LIMITE = int(os.environ.get("LIMITE", "5"))
-PAUSE_SPN = 30
 PAUSE_GET = 5
 TIMEOUT = 60
+FRAIS_MAX_H = int(os.environ.get("FRAIS_MAX_H", "168"))
+
+RAW_PARLEMENTAIRES = ("https://raw.githubusercontent.com/publicdatanetwork-dataparl/"
+                      "collaborateurs/main/data/referentiels/parlementaires.csv")
+RAW_AFFECTATIONS = ("https://raw.githubusercontent.com/publicdatanetwork-dataparl/"
+                    "collaborateurs/main/data/europarl/affectations.csv")
 API = "https://data.europarl.europa.eu/api/v2/meps"
-WB_SAVE = "https://web.archive.org/save/"
 WB_CDX = "https://web.archive.org/cdx/search/cdx"
 WB_WEB = "https://web.archive.org/web/"
-FRAIS_MAX_H = 72
 RDF_ABOUT = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about"
 
 HEADERS = {
@@ -56,6 +61,36 @@ def get(url, headers=HEADERS, timeout=TIMEOUT):
         return 0, str(e).encode()
 
 
+def meps_depuis_referentiel():
+    """Referentiel public du projet : chambre=europarl, actif=1."""
+    code, body = get(RAW_PARLEMENTAIRES)
+    if code != 200:
+        print(f"  referentiel: HTTP {code}")
+        return []
+    meps = []
+    lecteur = csv.DictReader(io.StringIO(body.decode("utf-8", "replace")))
+    for r in lecteur:
+        if r.get("chambre") == "europarl" and str(r.get("actif", "")).strip() == "1":
+            meps.append(str(r["elu_id"]).strip())
+    print(f"  referentiel parlementaires.csv : {len(meps)} MPE actifs")
+    return list(dict.fromkeys(meps))
+
+
+def meps_depuis_affectations():
+    """Repli : ids uniques du CSV d'affectations (public)."""
+    code, body = get(RAW_AFFECTATIONS)
+    if code != 200:
+        print(f"  affectations: HTTP {code}")
+        return []
+    ids = []
+    lecteur = csv.DictReader(io.StringIO(body.decode("utf-8", "replace")))
+    for r in lecteur:
+        if r.get("chambre") == "europarl" and r.get("elu_id"):
+            ids.append(str(r["elu_id"]).strip())
+    print(f"  affectations.csv : {len(set(ids))} MPE uniques")
+    return list(dict.fromkeys(ids))
+
+
 def extraire_ids_rdf(body):
     ids = []
     try:
@@ -73,125 +108,61 @@ def extraire_ids_rdf(body):
     return list(dict.fromkeys(ids))
 
 
-def pages_ids(params, tentatives=3):
-    ids, offset, essais = [], 0, 0
+def meps_depuis_api():
+    ids, offset = [], 0
+    params = {"parliamentary-term": "10", "limit": "200"}
     while True:
         q = dict(params, offset=str(offset))
         code, body = get(API + "?" + urllib.parse.urlencode(q))
         if code != 200 or not body:
-            essais += 1
-            print(f"  listing offset={offset}: HTTP {code}, essai {essais}/{tentatives}")
-            if essais >= tentatives:
-                return None
-            time.sleep(20)
-            continue
-        essais = 0
+            print(f"  API offset={offset}: HTTP {code}")
+            break
         lot = extraire_ids_rdf(body)
         if not lot:
-            with open("diag_api.txt", "w", encoding="utf-8") as f:
-                f.write(f"Requete : {API}?{urllib.parse.urlencode(q)}\n\n")
-                f.write(body.decode("utf-8", "replace")[:4000])
-            return None
-        ids.extend(lot)
-        if len(lot) < int(params["limit"]):
             break
-        offset += int(params["limit"])
-    return ids
+        ids.extend(lot)
+        if len(lot) < 200:
+            break
+        offset += 200
+    print(f"  API v2 : {len(set(ids))} MPE (pays non filtrable)")
+    return list(dict.fromkeys(ids))
 
 
-def meps_depuis_api():
-    params = {"parliamentary-term": "10", "limit": "200"}
-    ids = pages_ids(params)
-    if ids:
-        print(f"Listing API : {len(ids)} MPE (filtre pays ignore par l'API)")
-    return ids
-
-
-def spn_best_effort(url):
-    """Capture anonyme : souvent 523 (compte requis). Best effort, 2 essais."""
-    for essai in (1, 2):
-        code, _ = get(WB_SAVE + url)
-        if code in (200, 302, 303, 307, 308):
-            return code
-        print(f"    SPN essai {essai}: HTTP {code}")
-        if essai == 1:
-            time.sleep(45)
-    return code
+def meps():
+    for source in (meps_depuis_referentiel, meps_depuis_affectations, meps_depuis_api):
+        ids = source()
+        if ids:
+            print(f"Source MPE : {source.__name__} ({len(ids)})")
+            return ids
+    return []
 
 
 def snapshots_assistants(mid):
-    """CDX par prefixe : snapshots de /meps/<langue>/<id>/<slug>/assistants.
-    Retourne la liste [(timestamp, url_originale)] triee par date."""
+    """CDX par prefixe : dernier snapshot de la page assistants du MPE.
+    Methode identique a pe_historique.py : prefixe /meps/<langue>/,
+    filtre original:.*assistants.*."""
     q = urllib.parse.urlencode({
-        "url": f"europarl.europa.eu/meps/*/{mid}/*assistants*",
+        "url": f"europarl.europa.eu/meps/fr/{mid}/",
         "matchType": "prefix",
         "output": "json",
         "filter": "statuscode:200",
-        "collapse": "urlkey",
-        "limit": "-20",
+        "filter": "original:.*assistants.*",
+        "limit": "-10",
     })
     code, body = get(WB_CDX + "?" + q, timeout=90)
     if code != 200 or not body:
-        return []
+        return None
     try:
         lignes = json.loads(body.decode("utf-8", "replace"))
     except Exception:
-        return []
+        return None
     if len(lignes) < 2:
-        return []
+        return None
     entetes = lignes[0]
     i_ts, i_url = entetes.index("timestamp"), entetes.index("original")
     snaps = [(r[i_ts], r[i_url]) for r in lignes[1:]]
     snaps.sort(reverse=True)
     return snaps
-
-
-CATEGORIES = {
-    "accredited": "accredites",
-    "locaux": "locaux",
-    "local": "locaux",
-    "vice": "vice-presidence_questure",
-    "quaestor": "vice-presidence_questure",
-    "service provider": "prestataires",
-    "paying agent": "tiers_payants",
-    "trainee": "stagiaires",
-}
-
-
-def categorie_depuis(texte):
-    t = texte.lower()
-    if "stagiaire" in t or "trainee" in t:
-        return "stagiaires"
-    for cle, cat in CATEGORIES.items():
-        if cle in t:
-            return cat
-    return "autre"
-
-
-def parser_assistants(html, mep_id, snapshot):
-    soup = BeautifulSoup(html, "html.parser")
-    lignes = []
-    titres = soup.find_all(["h2", "h3", "h4", "h5", "summary"])
-    for t in titres:
-        texte = t.get_text(" ", strip=True)
-        if not any(m in texte.lower() for m in ("assistant", "provider", "paying", "agent")):
-            continue
-        cat = categorie_depuis(texte)
-        noms = set()
-        elem = t.find_next()
-        prof = 0
-        while elem is not None and prof < 40:
-            if getattr(elem, "name", None) in ("h2", "h3", "h4", "h5", "summary"):
-                break
-            if getattr(elem, "name", None) == "li":
-                nom = elem.get_text(" ", strip=True)
-                if nom and 3 <= len(nom) <= 120:
-                    noms.add(re.sub(r"\s+", " ", nom))
-            elem = elem.find_next()
-            prof += 1
-        for nom in noms:
-            lignes.append((mep_id, nom, cat, snapshot))
-    return lignes
 
 
 def age_heures(timestamp):
@@ -206,34 +177,96 @@ def age_heures(timestamp):
     return max(0.0, (time.time() - epoch) / 3600)
 
 
+CATEGORIES = {
+    "accrédité": "accredites",
+    "accredite": "accredites",
+    "accredited": "accredites",
+    "local": "locaux",
+    "vice": "vice-presidence_questure",
+    "questure": "vice-presidence_questure",
+    "quaestor": "vice-presidence_questure",
+    "service provider": "prestataires",
+    "prestataire": "prestataires",
+    "paying agent": "tiers_payants",
+    "payant": "tiers_payants",
+    "stagiaire": "stagiaires",
+    "trainee": "stagiaires",
+}
+
+
+def categorie_depuis(texte):
+    t = texte.lower()
+    if "stagiaire" in t or "trainee" in t:
+        return "stagiaires"
+    if "payant" in t or "paying" in t:
+        return "tiers_payants"
+    if "prestataire" in t or "service provider" in t:
+        return "prestataires"
+    if "vice" in t or "questur" in t or "quaestor" in t:
+        return "vice-presidence_questure"
+    if "accrédit" in t or "accredit" in t or "accredited" in t:
+        return "accredites"
+    if "local" in t:
+        return "locaux"
+    return "autre"
+
+
+def parser_assistants(html, mep_id, snapshot):
+    soup = BeautifulSoup(html, "html.parser")
+    lignes = []
+    titres = soup.find_all(["h2", "h3", "h4", "h5", "summary"])
+    for t in titres:
+        texte = t.get_text(" ", strip=True)
+        if not any(m in texte.lower() for m in ("assistant", "provider", "paying", "payant", "agent")):
+            continue
+        cat = categorie_depuis(texte)
+        noms = set()
+        elem = t.find_next()
+        prof = 0
+        while elem is not None and prof < 50:
+            if getattr(elem, "name", None) in ("h2", "h3", "h4", "h5", "summary"):
+                break
+            if getattr(elem, "name", None) in ("li", "tr"):
+                nom = elem.get_text(" ", strip=True)
+                if nom and 3 <= len(nom) <= 150:
+                    noms.add(re.sub(r"\s+", " ", nom))
+            elem = elem.find_next()
+            prof += 1
+        for nom in noms:
+            lignes.append((mep_id, nom, cat, snapshot))
+    return lignes
+
+
 def main():
-    meps = meps_depuis_api()
-    if not meps:
-        print("!! Listing MPE HS (diagnostics dans diag_api.txt)")
+    meps_liste = meps()
+    if not meps_liste:
+        print("!! Aucune source MPE disponible")
         sys.exit(2)
-    meps = meps[:LIMITE]
-    print(f"{len(meps)} MPE, pause {PAUSE_GET}s")
+    meps_liste = meps_liste[:LIMITE]
+    print(f"{len(meps_liste)} MPE a traiter, pause {PAUSE_GET}s, frais max {FRAIS_MAX_H}h")
 
     os.makedirs("data", exist_ok=True)
     lignes_csv = []
-    stats = {"ok": 0, "sans_snapshot": 0, "sans_noms": 0}
+    stats = {"ok": 0, "sans_snapshot": 0, "sans_noms": 0, "perimes": 0}
+    ages = []
     diag_premier = True
 
-    for i, mid in enumerate(meps, 1):
-        print(f"[{i}/{len(meps)}] {mid}: recherche snapshots CDX...")
+    for i, mid in enumerate(meps_liste, 1):
         snaps = snapshots_assistants(mid)
         if not snaps:
-            print(f"    {mid}: aucun snapshot -> KO")
+            print(f"[{i}/{len(meps_liste)}] {mid}: aucun snapshot -> KO")
             stats["sans_snapshot"] += 1
             time.sleep(PAUSE_GET)
             continue
         ts, url_originale = snaps[0]
         age = age_heures(ts)
-        fraicheur = "frais" if (age is not None and age <= FRAIS_MAX_H) else f"moyen ({age:.0f}h)"
+        if age is not None:
+            ages.append(age)
+        fraicheur = "frais" if (age is not None and age <= FRAIS_MAX_H) else f"perime ({age:.0f}h)" if age else "?"
 
         code, body = get(WB_WEB + ts + "/" + url_originale)
         if code != 200:
-            print(f"    {mid}: snapshot {ts} HTTP {code} -> KO")
+            print(f"[{i}/{len(meps_liste)}] {mid}: snapshot {ts} HTTP {code} -> KO")
             stats["sans_snapshot"] += 1
             time.sleep(PAUSE_GET)
             continue
@@ -248,10 +281,12 @@ def main():
         if trouvees:
             lignes_csv.extend(trouvees)
             stats["ok"] += 1
-            print(f"    {mid}: snapshot {ts} ({fraicheur}), {len(trouvees)} entrees")
+            print(f"[{i}/{len(meps_liste)}] {mid}: {ts} ({fraicheur}), {len(trouvees)} entrees")
         else:
             stats["sans_noms"] += 1
-            print(f"    {mid}: snapshot {ts} ({fraicheur}) mais 0 nom parse")
+            print(f"[{i}/{len(meps_liste)}] {mid}: {ts} ({fraicheur}), 0 nom parse")
+        if fraicheur.startswith("perime"):
+            stats["perimes"] += 1
         time.sleep(PAUSE_GET)
 
     with open("data/europarl_assistants.csv", "w", newline="", encoding="utf-8") as f:
@@ -261,17 +296,20 @@ def main():
             w.writerow([mid, nom, cat, snap,
                         f"https://www.europarl.europa.eu/meps/fr/{mid}/assistants"])
 
+    ages_txt = ", ".join(f"{a:.0f}h" for a in sorted(ages)[:5]) if ages else "aucun"
     print(f"\nResume : {stats['ok']} MPE collectes, {stats['sans_snapshot']} sans snapshot, "
-          f"{stats['sans_noms']} sans noms")
+          f"{stats['sans_noms']} sans noms, {stats['perimes']} perimes")
+    print(f"Ages des snapshots (5 plus frais) : {ages_txt}")
     print(f"Total lignes CSV : {len(lignes_csv)}")
 
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as s:
             s.write("## Collecte Wayback europarl\n\n")
-            s.write(f"- MPE traites : {len(meps)}\n")
+            s.write(f"- MPE traites : {len(meps_liste)}\n")
             s.write(f"- MPE collectes : {stats['ok']}\n")
             s.write(f"- Lignes CSV : {len(lignes_csv)}\n")
+            s.write(f"- Snapshots perimes (> {FRAIS_MAX_H}h) : {stats['perimes']}\n")
 
     if lignes_csv:
         sys.exit(0)
