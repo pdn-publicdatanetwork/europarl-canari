@@ -43,19 +43,9 @@ HEADERS = {
 }
 
 
-def get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True):
+def get(url, headers=HEADERS, timeout=TIMEOUT):
     req = urllib.request.Request(url, headers=headers)
     try:
-        if not allow_redirects:
-            class NoRedir(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, *a, **k):
-                    return None
-            opener = urllib.request.build_opener(NoRedir)
-            try:
-                with opener.open(req, timeout=timeout) as r:
-                    return r.status, r.read()
-            except urllib.error.HTTPError as e:
-                return e.code, e.read() if e.fp else b""
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
@@ -78,17 +68,33 @@ def extraire_ids_rdf(body):
     return list(dict.fromkeys(ids))
 
 
-def meps_depuis_api():
+def meps_depuis_api(tentatives=3):
     params = {"parliamentary-term": "10", "limit": "200"}
     ids, offset = [], 0
+    essais = 0
     while True:
         q = dict(params, offset=str(offset))
         code, body = get(API + "?" + urllib.parse.urlencode(q))
         if code != 200 or not body:
-            break
+            essais += 1
+            print(f"  listing offset={offset}: HTTP {code} ({len(body)} o), "
+                  f"essai {essais}/{tentatives}")
+            if essais >= tentatives:
+                with open("diag_api.txt", "w", encoding="utf-8") as f:
+                    f.write(f"Requete : {API}?{urllib.parse.urlencode(q)}\n")
+                    f.write(f"HTTP {code}, {len(body)} octets\n\n")
+                    f.write(body.decode("utf-8", "replace")[:4000])
+                return None
+            time.sleep(20)
+            continue
+        essais = 0
         lot = extraire_ids_rdf(body)
         if not lot:
-            break
+            print(f"  listing offset={offset}: 200 mais 0 MPE lisible")
+            with open("diag_api.txt", "w", encoding="utf-8") as f:
+                f.write(f"Requete : {API}?{urllib.parse.urlencode(q)}\n\n")
+                f.write(body.decode("utf-8", "replace")[:4000])
+            return None
         ids.extend(lot)
         if len(lot) < int(params["limit"]):
             break
@@ -97,18 +103,16 @@ def meps_depuis_api():
 
 
 def spn(url):
-    """Demande de capture anonyme. Suit la redirection vers le snapshot."""
     code, body = get(WB_SAVE + url)
     return code, body
 
 
 def dernier_snapshot(url):
-    """CDX : timestamp du snapshot le plus recent pour l'URL exacte."""
     q = urllib.parse.urlencode({
         "url": url, "output": "json", "limit": "1",
         "filter": "statuscode:200", "collapse": "digest",
     })
-    code, body = get(WB_CDX + "?" + q, headers={"User-Agent": HEADERS["User-Agent"]})
+    code, body = get(WB_CDX + "?" + q)
     if code != 200 or not body:
         return None
     try:
@@ -117,7 +121,7 @@ def dernier_snapshot(url):
         return None
     if len(lignes) < 2:
         return None
-    return lignes[1][1]  # colonne timestamp
+    return lignes[1][1]
 
 
 CATEGORIES = {
@@ -146,26 +150,21 @@ def parser_assistants(html, mep_id, snapshot):
     """Parse la page assistants d'un MPE : sections -> noms."""
     soup = BeautifulSoup(html, "html.parser")
     lignes = []
-    # les noms apparaissent dans des titres d'items de liste / tableaux
-    # structure vue en production : blocs par categorie avec titres
     titres = soup.find_all(["h2", "h3", "h4", "h5", "summary"])
-    for i, t in enumerate(titres):
+    for t in titres:
         texte = t.get_text(" ", strip=True)
-        if "assistant" not in texte.lower() and "provider" not in texte.lower() \
-           and "paying" not in texte.lower() and "agent" not in texte.lower():
+        if not any(m in texte.lower() for m in ("assistant", "provider", "paying", "agent")):
             continue
         cat = categorie_depuis(texte)
-        # collecter les elements freres suivants jusqu'au prochain titre
         noms = set()
         elem = t.find_next()
         prof = 0
         while elem is not None and prof < 40:
             if getattr(elem, "name", None) in ("h2", "h3", "h4", "h5", "summary"):
                 break
-            if getattr(elem, "name", None) in ("li",):
+            if getattr(elem, "name", None) == "li":
                 nom = elem.get_text(" ", strip=True)
-                # un nom d'assistant : pas un lien de menu, taille raisonnable
-                if nom and 3 <= len(nom) <= 120 and "\n" not in nom:
+                if nom and 3 <= len(nom) <= 120:
                     noms.add(re.sub(r"\s+", " ", nom))
             elem = elem.find_next()
             prof += 1
@@ -189,7 +188,7 @@ def age_heures(timestamp):
 def main():
     meps = meps_depuis_api()
     if not meps:
-        print("!! Listing MPE HS")
+        print("!! Listing MPE HS (diagnostics dans diag_api.txt)")
         sys.exit(2)
     meps = meps[:LIMITE]
     print(f"{len(meps)} MPE, pause SPN {PAUSE_SPN}s, pause GET {PAUSE_GET}s")
@@ -245,7 +244,8 @@ def main():
         w = csv.writer(f)
         w.writerow(["mep_id", "nom", "categorie", "snapshot", "url"])
         for mid, nom, cat, snap in lignes_csv:
-            w.writerow([mid, nom, cat, snap, f"https://www.europarl.europa.eu/meps/fr/{mid}/assistants"])
+            w.writerow([mid, nom, cat, snap,
+                        f"https://www.europarl.europa.eu/meps/fr/{mid}/assistants"])
 
     print(f"\nResume : {stats['ok']} MPE collectes, {stats['spn_ko']} SPN KO, "
           f"{stats['sans_snapshot']} sans snapshot, {stats['sans_noms']} sans noms")
