@@ -1,0 +1,49 @@
+name: Europarl canari WAF
+
+# Test quotidien : le WAF AWS d'europarl.europa.eu tolere-t-il des requetes
+# lentes depuis les IP Azure de GitHub Actions ?
+# Le job ECHOUE uniquement si 0 % de HTTP 200 (pour alerter).
+# Resume (job summary) + artifact CSV des codes HTTP obtenus.
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+    inputs:
+      limite:
+        description: "Nombre de MPE a tester (max 84)"
+        required: false
+        default: "84"
+
+concurrency:
+  group: europarl-canari
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  canari:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test WAF
+        env:
+          LIMITE: ${{ inputs.limite || '84' }}
+        run: python pe_canari.py
+
+      - name: Artifact resultats
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canari-resultats
+          path: canari_resultats.csv
+          if-no-files-found: ignore
