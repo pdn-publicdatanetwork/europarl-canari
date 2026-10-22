@@ -24,14 +24,24 @@ import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 
 LIMITE = int(os.environ.get("LIMITE", "5"))
-PAUSE_SPN = 30      # secondes entre deux demandes de capture (politesse SPN anonyme)
-PAUSE_GET = 5       # secondes entre deux telechargements de snapshot
+PAUSE_SPN = 30
+PAUSE_GET = 5
 TIMEOUT = 60
 API = "https://data.europarl.europa.eu/api/v2/meps"
 WB_SAVE = "https://web.archive.org/save/"
 WB_CDX = "https://web.archive.org/cdx/search/cdx"
 WB_WEB = "https://web.archive.org/web/"
-FRAIS_MAX_H = 72    # un snapshot plus vieux -> confiance "moyen"
+FRAIS_MAX_H = 72
+RDF_ABOUT = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about"
+
+# Variantes de filtre pays a tester ; on retient celle qui renvoie le moins
+# de MPE (84 francais attendus, 746 = filtre ignore).
+VARIANTES_PAYS = [
+    {"country-code": "FRA"},
+    {"countryCode": "FRA"},
+    {"country": "FRA"},
+    {"country": "France"},
+]
 
 HEADERS = {
     "User-Agent": (
@@ -61,36 +71,31 @@ def extraire_ids_rdf(body):
     except ET.ParseError:
         return []
     for elem in racine.iter():
-        for val in elem.attrib.values():
-            m = re.search(r"meps?/(\d+)", val)
-            if m:
-                ids.append(m.group(1))
+        uri = elem.attrib.get(RDF_ABOUT, "")
+        m = re.search(r"person/(\d+)", uri)
+        if m:
+            ids.append(m.group(1))
+        tag = elem.tag.rsplit("}", 1)[-1].lower()
+        if tag == "identifier" and (elem.text or "").strip().isdigit():
+            ids.append(elem.text.strip())
     return list(dict.fromkeys(ids))
 
 
-def meps_depuis_api(tentatives=3):
-    params = {"parliamentary-term": "10", "limit": "200"}
-    ids, offset = [], 0
-    essais = 0
+def pages_ids(params, tentatives=3):
+    ids, offset, essais = [], 0, 0
     while True:
         q = dict(params, offset=str(offset))
         code, body = get(API + "?" + urllib.parse.urlencode(q))
         if code != 200 or not body:
             essais += 1
-            print(f"  listing offset={offset}: HTTP {code} ({len(body)} o), "
-                  f"essai {essais}/{tentatives}")
+            print(f"  listing offset={offset}: HTTP {code}, essai {essais}/{tentatives}")
             if essais >= tentatives:
-                with open("diag_api.txt", "w", encoding="utf-8") as f:
-                    f.write(f"Requete : {API}?{urllib.parse.urlencode(q)}\n")
-                    f.write(f"HTTP {code}, {len(body)} octets\n\n")
-                    f.write(body.decode("utf-8", "replace")[:4000])
                 return None
             time.sleep(20)
             continue
         essais = 0
         lot = extraire_ids_rdf(body)
         if not lot:
-            print(f"  listing offset={offset}: 200 mais 0 MPE lisible")
             with open("diag_api.txt", "w", encoding="utf-8") as f:
                 f.write(f"Requete : {API}?{urllib.parse.urlencode(q)}\n\n")
                 f.write(body.decode("utf-8", "replace")[:4000])
@@ -100,6 +105,26 @@ def meps_depuis_api(tentatives=3):
             break
         offset += int(params["limit"])
     return ids
+
+
+def meps_depuis_api():
+    base = {"parliamentary-term": "10", "limit": "200"}
+    meilleur = None
+    for filtre in VARIANTES_PAYS:
+        params = dict(base, **filtre)
+        ids = pages_ids(params)
+        if ids is None:
+            print(f"  variante {filtre}: HS")
+            continue
+        print(f"  variante {filtre}: {len(ids)} MPE")
+        if meilleur is None or len(ids) < len(meilleur[1]):
+            meilleur = (filtre, ids)
+        if len(ids) <= 100:
+            break  # ~84 francais -> filtre efficace, inutile de tester le reste
+    if meilleur is None:
+        return None
+    print(f"Filtre pays retenu : {meilleur[0]} ({len(meilleur[1])} MPE)")
+    return meilleur[1]
 
 
 def spn(url):
@@ -147,7 +172,6 @@ def categorie_depuis(texte):
 
 
 def parser_assistants(html, mep_id, snapshot):
-    """Parse la page assistants d'un MPE : sections -> noms."""
     soup = BeautifulSoup(html, "html.parser")
     lignes = []
     titres = soup.find_all(["h2", "h3", "h4", "h5", "summary"])
