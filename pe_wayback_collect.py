@@ -2,9 +2,10 @@
 """Collecte des assistants des MPE francais via le Wayback Machine.
 
 Pipeline par MPE :
-  1. SPN anonyme : GET https://web.archive.org/save/<url> (capture du jour)
-  2. CDX : timestamp du snapshot le plus recent
-  3. Recuperation du snapshot et parsing HTML (categories + noms)
+  1. SPN anonyme (best effort, souvent 523 sans compte) : capture du jour
+  2. CDX par PREFIXE : dernier snapshot existant de la page assistants
+     (les snapshots Wayback sont sous la forme /meps/fr/<id>/<slug>/assistants)
+  3. Telechargement du snapshot et parsing HTML (categories + noms)
 Sortie : data/europarl_assistants.csv (mep_id, nom, categorie, snapshot, url)
 
 Aucune requete vers europarl.europa.eu : seul web.archive.org est sollicite.
@@ -33,15 +34,6 @@ WB_CDX = "https://web.archive.org/cdx/search/cdx"
 WB_WEB = "https://web.archive.org/web/"
 FRAIS_MAX_H = 72
 RDF_ABOUT = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about"
-
-# Variantes de filtre pays a tester ; on retient celle qui renvoie le moins
-# de MPE (84 francais attendus, 746 = filtre ignore).
-VARIANTES_PAYS = [
-    {"country-code": "FRA"},
-    {"countryCode": "FRA"},
-    {"country": "FRA"},
-    {"country": "France"},
-]
 
 HEADERS = {
     "User-Agent": (
@@ -108,45 +100,50 @@ def pages_ids(params, tentatives=3):
 
 
 def meps_depuis_api():
-    base = {"parliamentary-term": "10", "limit": "200"}
-    meilleur = None
-    for filtre in VARIANTES_PAYS:
-        params = dict(base, **filtre)
-        ids = pages_ids(params)
-        if ids is None:
-            print(f"  variante {filtre}: HS")
-            continue
-        print(f"  variante {filtre}: {len(ids)} MPE")
-        if meilleur is None or len(ids) < len(meilleur[1]):
-            meilleur = (filtre, ids)
-        if len(ids) <= 100:
-            break  # ~84 francais -> filtre efficace, inutile de tester le reste
-    if meilleur is None:
-        return None
-    print(f"Filtre pays retenu : {meilleur[0]} ({len(meilleur[1])} MPE)")
-    return meilleur[1]
+    params = {"parliamentary-term": "10", "limit": "200"}
+    ids = pages_ids(params)
+    if ids:
+        print(f"Listing API : {len(ids)} MPE (filtre pays ignore par l'API)")
+    return ids
 
 
-def spn(url):
-    code, body = get(WB_SAVE + url)
-    return code, body
+def spn_best_effort(url):
+    """Capture anonyme : souvent 523 (compte requis). Best effort, 2 essais."""
+    for essai in (1, 2):
+        code, _ = get(WB_SAVE + url)
+        if code in (200, 302, 303, 307, 308):
+            return code
+        print(f"    SPN essai {essai}: HTTP {code}")
+        if essai == 1:
+            time.sleep(45)
+    return code
 
 
-def dernier_snapshot(url):
+def snapshots_assistants(mid):
+    """CDX par prefixe : snapshots de /meps/<langue>/<id>/<slug>/assistants.
+    Retourne la liste [(timestamp, url_originale)] triee par date."""
     q = urllib.parse.urlencode({
-        "url": url, "output": "json", "limit": "1",
-        "filter": "statuscode:200", "collapse": "digest",
+        "url": f"europarl.europa.eu/meps/*/{mid}/*assistants*",
+        "matchType": "prefix",
+        "output": "json",
+        "filter": "statuscode:200",
+        "collapse": "urlkey",
+        "limit": "-20",
     })
-    code, body = get(WB_CDX + "?" + q)
+    code, body = get(WB_CDX + "?" + q, timeout=90)
     if code != 200 or not body:
-        return None
+        return []
     try:
         lignes = json.loads(body.decode("utf-8", "replace"))
     except Exception:
-        return None
+        return []
     if len(lignes) < 2:
-        return None
-    return lignes[1][1]
+        return []
+    entetes = lignes[0]
+    i_ts, i_url = entetes.index("timestamp"), entetes.index("original")
+    snaps = [(r[i_ts], r[i_url]) for r in lignes[1:]]
+    snaps.sort(reverse=True)
+    return snaps
 
 
 CATEGORIES = {
@@ -215,54 +212,47 @@ def main():
         print("!! Listing MPE HS (diagnostics dans diag_api.txt)")
         sys.exit(2)
     meps = meps[:LIMITE]
-    print(f"{len(meps)} MPE, pause SPN {PAUSE_SPN}s, pause GET {PAUSE_GET}s")
+    print(f"{len(meps)} MPE, pause {PAUSE_GET}s")
 
     os.makedirs("data", exist_ok=True)
     lignes_csv = []
-    stats = {"ok": 0, "spn_ko": 0, "sans_snapshot": 0, "sans_noms": 0}
+    stats = {"ok": 0, "sans_snapshot": 0, "sans_noms": 0}
     diag_premier = True
 
     for i, mid in enumerate(meps, 1):
-        url = f"https://www.europarl.europa.eu/meps/fr/{mid}/assistants"
-
-        code, _ = spn(url)
-        if code not in (200, 302, 303, 307, 308):
-            print(f"[{i}/{len(meps)}] {mid}: SPN HTTP {code} -> KO")
-            stats["spn_ko"] += 1
-        else:
-            print(f"[{i}/{len(meps)}] {mid}: SPN HTTP {code}")
-
-        snap = dernier_snapshot(url)
-        if not snap:
-            print(f"    {mid}: aucun snapshot CDX -> KO")
+        print(f"[{i}/{len(meps)}] {mid}: recherche snapshots CDX...")
+        snaps = snapshots_assistants(mid)
+        if not snaps:
+            print(f"    {mid}: aucun snapshot -> KO")
             stats["sans_snapshot"] += 1
-            time.sleep(PAUSE_SPN)
+            time.sleep(PAUSE_GET)
             continue
+        ts, url_originale = snaps[0]
+        age = age_heures(ts)
+        fraicheur = "frais" if (age is not None and age <= FRAIS_MAX_H) else f"moyen ({age:.0f}h)"
 
-        age = age_heures(snap)
-        fraicheur = "frais" if (age is not None and age <= FRAIS_MAX_H) else "moyen"
-        code2, body2 = get(WB_WEB + snap + "/" + url)
-        if code2 != 200:
-            print(f"    {mid}: snapshot {snap} HTTP {code2} -> KO")
+        code, body = get(WB_WEB + ts + "/" + url_originale)
+        if code != 200:
+            print(f"    {mid}: snapshot {ts} HTTP {code} -> KO")
             stats["sans_snapshot"] += 1
-            time.sleep(PAUSE_SPN)
+            time.sleep(PAUSE_GET)
             continue
 
         if diag_premier:
             with open("diag_page_exemple.txt", "w", encoding="utf-8") as f:
-                f.write(f"URL snapshot : {WB_WEB + snap + '/' + url}\n\n")
-                f.write(body2.decode("utf-8", "replace")[:6000])
+                f.write(f"URL snapshot : {WB_WEB + ts + '/' + url_originale}\n\n")
+                f.write(body.decode("utf-8", "replace")[:6000])
             diag_premier = False
 
-        trouvees = parser_assistants(body2, mid, snap)
+        trouvees = parser_assistants(body, mid, ts)
         if trouvees:
             lignes_csv.extend(trouvees)
             stats["ok"] += 1
-            print(f"    {mid}: snapshot {snap} ({fraicheur}), {len(trouvees)} entrees")
+            print(f"    {mid}: snapshot {ts} ({fraicheur}), {len(trouvees)} entrees")
         else:
             stats["sans_noms"] += 1
-            print(f"    {mid}: snapshot {snap} ({fraicheur}) mais 0 nom parse")
-        time.sleep(PAUSE_SPN if code not in (200, 302) else PAUSE_GET)
+            print(f"    {mid}: snapshot {ts} ({fraicheur}) mais 0 nom parse")
+        time.sleep(PAUSE_GET)
 
     with open("data/europarl_assistants.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -271,8 +261,8 @@ def main():
             w.writerow([mid, nom, cat, snap,
                         f"https://www.europarl.europa.eu/meps/fr/{mid}/assistants"])
 
-    print(f"\nResume : {stats['ok']} MPE collectes, {stats['spn_ko']} SPN KO, "
-          f"{stats['sans_snapshot']} sans snapshot, {stats['sans_noms']} sans noms")
+    print(f"\nResume : {stats['ok']} MPE collectes, {stats['sans_snapshot']} sans snapshot, "
+          f"{stats['sans_noms']} sans noms")
     print(f"Total lignes CSV : {len(lignes_csv)}")
 
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
