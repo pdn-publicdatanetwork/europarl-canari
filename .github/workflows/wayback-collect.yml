@@ -1,0 +1,95 @@
+name: Collecte Wayback europarl
+
+# Collecte quotidienne des pages assistants des MPE francais via le Wayback
+# Machine (SPN anonyme -> snapshot -> parsing HTML). Aucune requete directe a
+# europarl.europa.eu : le WAF n'est jamais sollicite par nos IP.
+# Se declenche a chaque push (boucle de developpement) + cron quotidien.
+
+on:
+  push:
+    paths:
+      - "pe_wayback_collect.py"
+      - ".github/workflows/wayback-collect.yml"
+  schedule:
+    - cron: "7 4 * * *"
+  workflow_dispatch:
+    inputs:
+      limite:
+        description: "Nombre de MPE a collecter (max 84)"
+        required: false
+        default: "84"
+
+concurrency:
+  group: europarl-wayback
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  collecte:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Deps
+        run: pip install beautifulsoup4
+
+      - name: Collecte
+        id: collecte
+        env:
+          LIMITE: ${{ inputs.limite || '5' }}
+        run: python pe_wayback_collect.py 2>&1 | tee sortie.txt
+        continue-on-error: true
+
+      - name: Commit CSV
+        if: steps.collecte.outcome == 'success'
+        run: |
+          if git diff --quiet data/; then
+            echo "Aucun changement de donnees"
+          else
+            git config user.name "DataParl"
+            git config user.email "support@dataparl.fr"
+            git add data/
+            git commit -m "Collecte Wayback europarl ${{ github.run_number }} [skip ci]"
+            git push
+          fi
+
+      - name: Bilan dans une issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_TITLE: "Collecte Wayback #${{ github.run_number }}"
+        run: |
+          {
+            echo "## Run #${{ github.run_number }}"
+            echo ""
+            echo "- Etat du job : ${{ steps.collecte.outcome }}"
+            echo "- Lien run : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo ""
+            echo '<details><summary>Sortie du script</summary>'
+            echo ""
+            echo '~~~'
+            cat sortie.txt
+            echo '~~~'
+            echo "</details>"
+            echo ""
+            for f in diag_*.txt; do
+              [ -e "$f" ] || continue
+              echo "<details><summary>Diagnostic ${f}</summary>"
+              echo ""
+              echo '~~~'
+              cat "$f"
+              echo '~~~'
+              echo "</details>"
+            done
+          } > corps_issue.md
+          gh issue create --title "$ISSUE_TITLE" --body-file corps_issue.md
