@@ -13,9 +13,11 @@ Aucune donnee personnelle n'est extraite : on ne releve que des codes HTTP.
 import csv
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 LIMITE = int(os.environ.get("LIMITE", "84"))
@@ -32,11 +34,8 @@ HEADERS = {
     "Accept-Language": "fr,fr-FR;q=0.8,en;q=0.6",
 }
 
-# Variantes de requete, de la plus ciblee a la plus large. La premiere qui
-# renvoie au moins un MPE gagne. limit=0 renvoie 204 (piege du 22/10/2026).
 VARIANTES = [
     {"format": "jsonl", "parliamentary-term": "10", "country-code": "FRA", "limit": "200"},
-    {"format": "jsonl", "parliamentary-term": "10", "country-code": "France", "limit": "200"},
     {"format": "jsonl", "parliamentary-term": "10", "limit": "200"},
     {"format": "jsonl", "limit": "200"},
 ]
@@ -53,46 +52,83 @@ def get(url, headers=HEADERS, timeout=TIMEOUT):
         return 0, str(e).encode()
 
 
+def iter_objets(body):
+    """Genere les objets JSON d'une reponse, quel que soit son habillage :
+    JSONL (un objet par ligne), JSON tableau unique, JSON-LD avec @graph."""
+    texte = body.decode("utf-8", "replace").strip()
+    # 1) JSONL : un objet par ligne
+    lignes = [l for l in texte.splitlines() if l.strip()]
+    if len(lignes) > 1:
+        ok = 0
+        for l in lignes:
+            try:
+                json.loads(l)
+                ok += 1
+            except Exception:
+                ok = 0
+                break
+        if ok:
+            for l in lignes:
+                yield json.loads(l)
+            return
+    # 2) JSON unique (tableau, @graph, ou objet)
+    try:
+        doc = json.loads(texte)
+    except Exception:
+        return
+    pile = [doc]
+    while pile:
+        n = pile.pop()
+        if isinstance(n, list):
+            pile.extend(n)
+        elif isinstance(n, dict):
+            if "@graph" in n and isinstance(n["@graph"], list):
+                pile.extend(n["@graph"])
+            else:
+                yield n
+
+
 def extraire_ids(body):
     ids = []
-    for line in body.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
+    for obj in iter_objets(body):
         ident = obj.get("identifier")
         if ident is None and isinstance(obj.get("id"), str):
-            # id sous forme d'URI .../meps/197486 -> extraire le numero
             fin = obj["id"].rstrip("/").rsplit("/", 1)[-1]
-            ident = fin if fin.isdigit() else None
+            if fin.isdigit():
+                ident = fin
+        if ident is None:
+            # chercher une URI .../meps/<numero> dans les valeurs
+            for v in obj.values():
+                if isinstance(v, str):
+                    m = re.search(r"/meps/(\d+)", v)
+                    if m:
+                        ident = m.group(1)
+                        break
         if ident:
             ids.append(str(ident))
     return list(dict.fromkeys(ids))
 
 
 def meps_depuis_api():
-    import urllib.parse
-
     for params in VARIANTES:
         ids, offset = [], 0
         while True:
             q = dict(params)
             q["offset"] = str(offset)
             url = API + "?" + urllib.parse.urlencode(q)
-            code, body = get(url, headers={"Accept": "application/json", "User-Agent": HEADERS["User-Agent"]})
+            code, body = get(url)
             if code != 200 or not body:
                 print(f"  variante {params} offset={offset}: HTTP {code} ({len(body)} o)")
                 break
             lot = extraire_ids(body)
             if not lot:
-                print(f"  variante {params} offset={offset}: 200 mais 0 MPE lisible")
+                print(f"  variante {params} offset={offset}: 200, {len(body)} octets, 0 MPE lisible")
+                print("  diagnostic, 300 premiers caracteres du corps :")
+                print("  " + body.decode("utf-8", "replace")[:300])
                 break
             ids.extend(lot)
             if len(lot) < int(params["limit"]):
-                break  # derniere page
+                break
             offset += int(params["limit"])
         if ids:
             print(f"Variante retenue : {params} -> {len(ids)} MPE")
@@ -112,7 +148,6 @@ def main():
 
     pages = [("CENTRALE", "https://www.europarl.europa.eu/meps/fr/assistants")]
     for ident in meps:
-        # Sans slug connu, on tente la forme courte ; 404 != blocage WAF.
         pages.append((ident, f"https://www.europarl.europa.eu/meps/fr/{ident}/assistants"))
 
     resultats = []
